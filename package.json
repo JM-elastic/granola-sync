@@ -1,0 +1,21 @@
+{
+  "name": "granola-sync",
+  "version": "1.0.0",
+  "description": "Sync Granola meeting notes to Google Drive as Google Docs",
+  "type": "module",
+  "scripts": {
+    "start": "tsx sync.ts",
+    "sync": "tsx sync.ts",
+    "sync:date": "tsx sync.ts --date",
+    "sync:all": "tsx sync.ts --all",
+    "sync:once": "tsx sync.ts --once"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.0",
+    "googleapis": "^144.0.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
