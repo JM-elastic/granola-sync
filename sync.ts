@@ -4,11 +4,15 @@
  * Syncs meeting notes from Granola (https://granola.ai) to Google Drive
  * as Google Docs. Reads Granola's local credentials automatically.
  *
+ * Supports syncing all notes or specific Granola folders, and preserves
+ * folder structure in Google Drive.
+ *
  * Usage:
- *   npm run sync              # Run continuously (syncs every N minutes)
- *   npm run sync -- --once    # Sync once and exit
- *   npm run sync -- --date 2026-04-01  # Sync notes from a specific date
- *   npm run sync -- --all     # Sync all notes (no date filter)
+ *   npm run sync                        # Run continuously
+ *   npm run sync -- --once              # Sync once and exit
+ *   npm run sync -- --date 2026-04-01   # Sync notes from a specific date
+ *   npm run sync -- --all               # Sync all notes (no date filter)
+ *   npm run sync -- --discover          # Show Granola API fields (for debugging)
  */
 
 import { config } from 'dotenv';
@@ -30,8 +34,18 @@ const GRANOLA_CREDS_PATH = join(
 
 const SYNC_INTERVAL_MIN = parseInt(process.env.SYNC_INTERVAL_MINUTES || '30', 10);
 const SYNC_DAYS_BACK = parseInt(process.env.SYNC_DAYS_BACK || '3', 10);
-const DRIVE_FOLDER = process.env.DRIVE_FOLDER || 'meetingnotes/Unsorted';
-const DRIVE_ROOT_FOLDER = DRIVE_FOLDER.split('/')[0];
+
+// Granola folder sync mode: "all" syncs everything, "folders" syncs only listed folders
+const GRANOLA_SYNC_MODE = (process.env.GRANOLA_SYNC_MODE || 'all').toLowerCase();
+// Comma-separated list of Granola folder names to sync (when mode = "folders")
+const GRANOLA_FOLDERS = (process.env.GRANOLA_FOLDERS || '')
+  .split(',')
+  .map((f) => f.trim())
+  .filter(Boolean);
+
+// Google Drive root folder for synced docs (empty = Drive root)
+// e.g., "meetingnotes" places all docs under a "meetingnotes" folder
+const DRIVE_ROOT = process.env.DRIVE_ROOT || '';
 
 // ─────────────────────────────────────────────────────────────
 // Google Drive Setup
@@ -62,6 +76,13 @@ interface GranolaDocument {
   last_viewed_panel?: {
     content?: any; // ProseMirror JSON
   };
+  // Folder info — field names discovered from API
+  folder_name?: string;
+  folder_id?: string;
+  folder?: { name?: string; id?: string } | string;
+  group_name?: string;
+  group?: { name?: string } | string;
+  [key: string]: unknown; // allow unknown fields
 }
 
 interface TranscriptUtterance {
@@ -69,6 +90,24 @@ interface TranscriptUtterance {
   text: string;
   start_time?: number;
   end_time?: number;
+}
+
+/**
+ * Extract the folder name from a Granola document.
+ * The API field name varies — we check several common patterns.
+ */
+function getDocFolder(doc: GranolaDocument): string | null {
+  // Direct field
+  if (doc.folder_name && typeof doc.folder_name === 'string') return doc.folder_name;
+  if (doc.group_name && typeof doc.group_name === 'string') return doc.group_name;
+
+  // Nested object
+  if (doc.folder && typeof doc.folder === 'object' && 'name' in doc.folder) return doc.folder.name || null;
+  if (doc.folder && typeof doc.folder === 'string') return doc.folder;
+  if (doc.group && typeof doc.group === 'object' && 'name' in doc.group) return doc.group.name || null;
+  if (doc.group && typeof doc.group === 'string') return doc.group;
+
+  return null;
 }
 
 function getGranolaToken(): string | null {
@@ -206,11 +245,25 @@ function proseMirrorToText(content: any): string {
 // Google Drive Operations
 // ─────────────────────────────────────────────────────────────
 
+// Cache folder IDs to avoid repeated lookups
+const folderIdCache = new Map<string, string>();
+
 async function getOrCreateFolder(folderPath: string): Promise<string> {
-  const parts = folderPath.split('/');
+  if (folderIdCache.has(folderPath)) return folderIdCache.get(folderPath)!;
+
+  const parts = folderPath.split('/').filter(Boolean);
   let parentId = 'root';
 
+  // Build up path incrementally, caching each segment
+  let pathSoFar = '';
   for (const part of parts) {
+    pathSoFar = pathSoFar ? `${pathSoFar}/${part}` : part;
+
+    if (folderIdCache.has(pathSoFar)) {
+      parentId = folderIdCache.get(pathSoFar)!;
+      continue;
+    }
+
     const query = `name='${part}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
     const response = await drive.files.list({
       q: query,
@@ -230,8 +283,11 @@ async function getOrCreateFolder(folderPath: string): Promise<string> {
       });
       parentId = folder.data.id!;
     }
+
+    folderIdCache.set(pathSoFar, parentId);
   }
 
+  folderIdCache.set(folderPath, parentId);
   return parentId;
 }
 
@@ -265,7 +321,6 @@ async function buildExistingDocsMap(rootFolderId: string): Promise<{
 
   await scan(rootFolderId);
 
-  // Check trashed docs to avoid re-creating deleted notes
   const trashedRes = await drive.files.list({
     q: `appProperties has { key='source' and value='granola-sync' } and trashed=true`,
     fields: 'files(id, name, appProperties)',
@@ -341,8 +396,27 @@ async function updateDocContent(docId: string, content: string): Promise<void> {
   });
 }
 
+/**
+ * Determine the Google Drive destination folder for a document.
+ * If the doc has a Granola folder, mirror that structure in Drive.
+ */
+function getDriveFolderPath(doc: GranolaDocument): string {
+  const folder = getDocFolder(doc);
+  const parts: string[] = [];
+
+  if (DRIVE_ROOT) parts.push(DRIVE_ROOT);
+
+  if (folder) {
+    parts.push(folder);
+  } else {
+    // No folder — place in "Unsorted" subfolder
+    parts.push('Unsorted');
+  }
+
+  return parts.join('/');
+}
+
 async function createOrUpdateDoc(
-  folderId: string,
   doc: GranolaDocument,
   token: string,
   existingDocs: { existing: Map<string, string>; deletedTitles: Set<string>; deletedGranolaIds: Set<string> }
@@ -359,7 +433,6 @@ async function createOrUpdateDoc(
 
   const existingDocId = existingDocs.existing.get(title) ?? null;
 
-  // Check if existing doc is empty and needs updating
   let shouldUpdate = false;
   if (existingDocId) {
     const empty = await isDocEmpty(existingDocId);
@@ -384,20 +457,22 @@ async function createOrUpdateDoc(
     transcriptContent = await fetchDocumentTranscript(token, doc.id);
   }
 
-  // Build final content
   const content = formatDocContent(doc, notesContent, transcriptContent);
 
-  // Skip if both notes and transcript are empty
   if (content.trim().length < 50) {
     console.log(`   ⚠️  Skipping (no content): ${title}`);
     return;
   }
 
-  // Update existing empty doc or create new one
   if (shouldUpdate && existingDocId) {
     await updateDocContent(existingDocId, content);
     console.log(`   ✅ Updated: ${title}`);
   } else {
+    // Determine destination folder and ensure it exists
+    const folderPath = getDriveFolderPath(doc);
+    const folderId = await getOrCreateFolder(folderPath);
+    const folderLabel = getDocFolder(doc) || 'Unsorted';
+
     const newDoc = await drive.files.create({
       requestBody: {
         name: title,
@@ -422,7 +497,7 @@ async function createOrUpdateDoc(
           ],
         },
       });
-      console.log(`   ✅ Created: ${title}`);
+      console.log(`   ✅ Created: ${title} → ${folderLabel}/`);
     }
   }
 }
@@ -432,14 +507,16 @@ function formatDocContent(
   notesContent: string,
   transcriptContent: string | null = null
 ): string {
+  const folder = getDocFolder(doc);
   const parts = [
     doc.title || 'Untitled Meeting',
     '',
     `Date: ${new Date(doc.created_at).toLocaleString()}`,
-    '',
-    '---',
-    '',
   ];
+
+  if (folder) parts.push(`Folder: ${folder}`);
+
+  parts.push('', '---', '');
 
   if (notesContent && notesContent.trim()) {
     parts.push('## Notes', '', notesContent, '');
@@ -482,34 +559,63 @@ async function sync(options: {
   }
 
   try {
-    console.log('📁 Ensuring Google Drive folder exists...');
-    const rootFolderId = await getOrCreateFolder(DRIVE_ROOT_FOLDER);
-    const destFolderId = await getOrCreateFolder(DRIVE_FOLDER);
+    // Determine the root folder for dedup scanning
+    const scanRootId = DRIVE_ROOT
+      ? await getOrCreateFolder(DRIVE_ROOT)
+      : 'root';
+
+    if (DRIVE_ROOT) {
+      console.log(`📁 Drive root: ${DRIVE_ROOT}/`);
+    }
 
     console.log('🗂️  Indexing existing docs...');
-    const existingDocs = await buildExistingDocsMap(rootFolderId);
+    const existingDocs = await buildExistingDocsMap(scanRootId);
     console.log(`   Indexed ${existingDocs.existing.size} existing docs`);
 
     console.log('📥 Fetching meeting notes...');
     let documents = await fetchGranolaDocuments(token);
 
+    // Apply folder filter
+    if (GRANOLA_SYNC_MODE === 'folders' && GRANOLA_FOLDERS.length > 0) {
+      const totalCount = documents.length;
+      const folderSet = new Set(GRANOLA_FOLDERS.map((f) => f.toLowerCase()));
+      documents = documents.filter((doc) => {
+        const folder = getDocFolder(doc);
+        return folder && folderSet.has(folder.toLowerCase());
+      });
+      console.log(`   Folder filter: ${GRANOLA_FOLDERS.join(', ')}`);
+      console.log(`   ${totalCount} total → ${documents.length} in selected folders`);
+    }
+
     // Apply date filter
     if (options.filterDate) {
       const totalCount = documents.length;
       documents = documents.filter((doc) => doc.created_at.startsWith(options.filterDate!));
-      console.log(`   Found ${totalCount} documents, ${documents.length} from ${options.filterDate}`);
+      console.log(`   Found ${documents.length} documents from ${options.filterDate} (of ${totalCount})`);
     } else if (!options.all && options.daysBack && options.daysBack > 0) {
       const totalCount = documents.length;
       documents = documents.filter((doc) => isRecent(doc.created_at, options.daysBack!));
-      console.log(`   Found ${totalCount} documents, ${documents.length} from last ${options.daysBack} days`);
+      console.log(`   Found ${documents.length} documents from last ${options.daysBack} days (of ${totalCount})`);
     } else {
       console.log(`   Found ${documents.length} documents (no date filter)`);
+    }
+
+    // Group by folder for logging
+    const byFolder = new Map<string, number>();
+    for (const doc of documents) {
+      const folder = getDocFolder(doc) || 'Unsorted';
+      byFolder.set(folder, (byFolder.get(folder) || 0) + 1);
+    }
+    if (byFolder.size > 1 || (byFolder.size === 1 && !byFolder.has('Unsorted'))) {
+      for (const [folder, count] of byFolder) {
+        console.log(`   📂 ${folder}: ${count} notes`);
+      }
     }
 
     console.log('📤 Syncing to Google Drive...');
     for (const doc of documents) {
       try {
-        await createOrUpdateDoc(destFolderId, doc, token, existingDocs);
+        await createOrUpdateDoc(doc, token, existingDocs);
       } catch (err: any) {
         console.log(`   ❌ Failed to sync "${doc.title}": ${err.message}`);
       }
@@ -518,6 +624,54 @@ async function sync(options: {
     console.log('✅ Sync complete');
   } catch (err: any) {
     console.log(`❌ Sync failed: ${err.message}`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Discovery (--discover flag)
+// ─────────────────────────────────────────────────────────────
+
+async function discover(): Promise<void> {
+  console.log('🔍 Discovering Granola API document structure...\n');
+
+  const token = getGranolaToken();
+  if (!token) return;
+
+  const documents = await fetchGranolaDocuments(token);
+  if (documents.length === 0) {
+    console.log('No documents found.');
+    return;
+  }
+
+  // Show all keys on first few docs
+  console.log(`Found ${documents.length} documents. Inspecting first 3:\n`);
+  for (const doc of documents.slice(0, 3)) {
+    console.log(`─── ${doc.title} ───`);
+    console.log(`  Keys: ${Object.keys(doc).join(', ')}`);
+
+    // Show folder-related fields
+    for (const key of Object.keys(doc)) {
+      const lower = key.toLowerCase();
+      if (lower.includes('folder') || lower.includes('group') || lower.includes('parent') || lower.includes('workspace') || lower.includes('collection')) {
+        console.log(`  ${key}: ${JSON.stringify((doc as any)[key])}`);
+      }
+    }
+
+    const folder = getDocFolder(doc);
+    console.log(`  → Detected folder: ${folder || '(none)'}`);
+    console.log();
+  }
+
+  // Summary of all folders found
+  const folders = new Map<string, number>();
+  for (const doc of documents) {
+    const folder = getDocFolder(doc) || '(none)';
+    folders.set(folder, (folders.get(folder) || 0) + 1);
+  }
+
+  console.log('── Folder Summary ──');
+  for (const [folder, count] of folders) {
+    console.log(`  ${folder}: ${count} notes`);
   }
 }
 
@@ -531,6 +685,13 @@ async function main() {
   const specificDate = dateIdx >= 0 ? args[dateIdx + 1] : null;
   const once = args.includes('--once');
   const all = args.includes('--all');
+  const discoverMode = args.includes('--discover');
+
+  // Discovery mode — show API fields and exit
+  if (discoverMode) {
+    await discover();
+    return;
+  }
 
   // One-time sync for a specific date
   if (specificDate) {
@@ -558,13 +719,18 @@ async function main() {
   }
 
   // Continuous mode
+  const modeLabel = GRANOLA_SYNC_MODE === 'folders' && GRANOLA_FOLDERS.length > 0
+    ? `Folders: ${GRANOLA_FOLDERS.join(', ')}`
+    : 'All folders';
+
   console.log('╔════════════════════════════════════════════════════════════╗');
   console.log('║  Granola Sync                                              ║');
   console.log('║  Syncing meeting notes to Google Drive                    ║');
   console.log('╠════════════════════════════════════════════════════════════╣');
-  console.log(`║  Interval: ${SYNC_INTERVAL_MIN} minutes                                        ║`);
-  console.log(`║  Days back: ${SYNC_DAYS_BACK}                                                 ║`);
-  console.log(`║  Destination: Google Drive/${DRIVE_FOLDER}             ║`);
+  console.log(`║  Mode: ${modeLabel}`);
+  console.log(`║  Interval: ${SYNC_INTERVAL_MIN} minutes`);
+  console.log(`║  Days back: ${SYNC_DAYS_BACK}`);
+  console.log(`║  Drive root: ${DRIVE_ROOT || '(Drive root)'}`);
   console.log('╚════════════════════════════════════════════════════════════╝');
 
   async function runCycle(): Promise<void> {

@@ -8,7 +8,8 @@
     "sync": "tsx sync.ts",
     "sync:date": "tsx sync.ts --date",
     "sync:all": "tsx sync.ts --all",
-    "sync:once": "tsx sync.ts --once"
+    "sync:once": "tsx sync.ts --once",
+    "sync:discover": "tsx sync.ts --discover"
   },
   "dependencies": {
     "dotenv": "^16.4.0",

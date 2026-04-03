@@ -2,11 +2,13 @@
 
 Sync your [Granola](https://granola.ai) meeting notes to Google Drive as Google Docs.
 
-Granola is a meeting notes app that records and transcribes meetings. This tool reads your notes from Granola's local API and creates/updates Google Docs in a specified Drive folder, making your meeting notes searchable and accessible from anywhere.
+Granola is a meeting notes app that records and transcribes meetings. This tool reads your notes from Granola's local API and creates/updates Google Docs in a specified Drive folder, preserving your Granola folder structure.
 
 ## Features
 
 - Syncs meeting notes (ProseMirror content) and transcripts to Google Docs
+- Preserves Granola folder structure in Google Drive
+- Sync all folders or filter to specific ones
 - Deduplicates — won't re-create docs that already exist
 - Respects deleted docs — won't re-sync notes you've trashed
 - Scans entire folder tree to detect docs moved between subfolders
@@ -29,7 +31,7 @@ Granola is a meeting notes app that records and transcribes meetings. This tool 
    npm install
    ```
 
-2. Copy `.env.example` to `.env` and fill in your Google OAuth2 credentials:
+2. Copy `.env.example` to `.env` and fill in your credentials:
    ```bash
    cp .env.example .env
    ```
@@ -56,11 +58,16 @@ npm run sync:date -- 2026-04-01
 
 # Sync all notes (no date filter)
 npm run sync:all
+
+# Discover API structure (useful for debugging folder detection)
+npm run sync -- --discover
 ```
 
 ## Configuration
 
 All configuration is via environment variables in `.env`:
+
+### Google OAuth2
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -68,20 +75,62 @@ All configuration is via environment variables in `.env`:
 | `GOOGLE_CLIENT_SECRET` | — | OAuth2 client secret |
 | `GOOGLE_REDIRECT_URI` | — | OAuth2 redirect URI |
 | `GOOGLE_REFRESH_TOKEN` | — | OAuth2 refresh token |
-| `DRIVE_FOLDER` | `meetingnotes/Unsorted` | Google Drive destination path |
-| `SYNC_INTERVAL_MINUTES` | `30` | Minutes between sync cycles |
+
+### Folder Sync
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GRANOLA_SYNC_MODE` | `all` | `all` = sync everything, `folders` = only listed folders |
+| `GRANOLA_FOLDERS` | — | Comma-separated Granola folder names (e.g., `Elastic,Personal`) |
+
+### Google Drive Destination
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DRIVE_ROOT` | _(empty)_ | Root folder in Drive (e.g., `meetingnotes`). Created if missing. |
+
+Granola folder structure is preserved under the root:
+```
+DRIVE_ROOT/
+├── Elastic/
+│   ├── 2026-04-01 - Sprint Planning.gdoc
+│   └── 2026-04-02 - 1:1 with Manager.gdoc
+├── Personal/
+│   └── 2026-04-01 - Doctor Appointment.gdoc
+└── Unsorted/
+    └── 2026-04-02 - Quick Call.gdoc
+```
+
+Notes without a Granola folder go into `Unsorted/`.
+
+### Sync Behavior
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SYNC_INTERVAL_MINUTES` | `30` | Minutes between sync cycles (continuous mode) |
 | `SYNC_DAYS_BACK` | `3` | Only sync notes from the last N days (0 = all) |
 
 ## How It Works
 
 1. Reads Granola's auth token from `~/Library/Application Support/Granola/supabase.json`
 2. Fetches meeting documents via Granola's API
-3. For each document:
+3. Filters by folder and date as configured
+4. For each document:
+   - Determines the Google Drive destination folder (matching Granola folder structure)
    - Extracts notes from ProseMirror JSON format
    - Falls back to transcript if notes are empty
-   - Creates a Google Doc in the destination folder (or updates if empty)
+   - Creates a Google Doc (or updates if existing doc is empty)
    - Tags the doc with `source=granola-sync` for tracking
-4. Skips documents that already exist or have been trashed
+5. Skips documents that already exist or have been trashed
+
+## Debugging
+
+If folder detection isn't working, run:
+```bash
+npm run sync -- --discover
+```
+
+This shows the raw API fields on your documents and which folder name was detected, helping you configure `GRANOLA_FOLDERS` correctly.
 
 ## Notes
 
